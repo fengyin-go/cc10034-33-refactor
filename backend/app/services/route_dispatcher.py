@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.matching import ROUTE_VALUE_FIELDS, EventMatchData
 from app.services.base import BaseModuleService
 from app.pipeline import pipeline_bus
 
@@ -27,7 +28,25 @@ class RouteDispatcherService(BaseModuleService):
 
         根据规则匹配条件和分发策略，将事件定向到目标通道。
         支持广播、加权分发和备通道降级。
+
+        判定取值和原始事件都来自过滤入口登记的共用匹配数据：路由读到的
+        始终是过滤放行当时的事件快照，即使同一自然键的后一笔事件已在
+        队列里等待，也不会覆盖本笔的镜像。
         """
+        data = pipeline_bus.acquire_match_data(event)
+        return self._route_with_data(data, config)
+
+    def resume_route(self, data: EventMatchData, config: dict[str, Any]) -> dict[str, Any]:
+        """按已有匹配数据继续中断的路由，已完成的步骤不重复执行。
+
+        若上次中断在审计之前，本次补写这一条审计；否则沿用首次结果。
+        """
+        step = self._route_step_key(config)
+        if step in data.step_results and step in data.audited_steps:
+            return data.step_results[step]
+        return self._route_with_data(data, config)
+
+    def _route_with_data(self, data: EventMatchData, config: dict[str, Any]) -> dict[str, Any]:
         condition = config.get("匹配条件", "")
         target = config.get("目标通道", "default_sink")
         strategy = config.get("分发策略", "round_robin")
@@ -35,13 +54,16 @@ class RouteDispatcherService(BaseModuleService):
         weight = int(config.get("权重", "1"))
         backup = config.get("备用目标", "")
 
-        event_str = str(event)
-        if condition and condition not in event_str and condition not in event.get("来源表", ""):
+        if condition and not data.values.contains(condition, ROUTE_VALUE_FIELDS):
+            data.route_failures += 1
+            # 条件不匹配是终局判定；数据归位后可复用，不再占用待路由队列。
+            pipeline_bus.complete_match_data(data)
             return {"routed": False, "reason": "condition_mismatch"}
 
+        event_id = data.display_event_id
         route_result: dict[str, Any] = {
             "routed": True,
-            "event_id": event.get("事件ID", ""),
+            "event_id": event_id,
             "rule": config.get("规则名称"),
             "strategy": strategy,
             "broadcast": broadcast,
@@ -57,20 +79,58 @@ class RouteDispatcherService(BaseModuleService):
         if backup:
             route_result["backup_target"] = backup
 
-        pipeline_bus.routing_table.append({
-            "name": config.get("规则名称"),
-            "condition": condition,
-            "target": target,
-            "enabled": config.get("status") == "已启用",
-        })
+        # 以下副作用按进度标记续做：路由中断后继续时只补做未完成的步骤，
+        # 因此登记顺序、指标计数和审计次数与一次性路由一致。
+        # 多条规则命中同一事件时，每条规则仍各自登记、计数和审计一次。
+        step = self._route_step_key(config)
+        if step not in data.completed_steps:
+            data.completed_steps.add(step)
+            data.step_dispatched_count += 1
+            pipeline_bus.routing_table.append({
+                "name": config.get("规则名称"),
+                "condition": condition,
+                "target": target,
+                "enabled": config.get("status") == "已启用",
+            })
+            pipeline_bus.pipeline_metrics["routed"] += 1
+        if step not in data.audited_steps:
+            pipeline_bus.write_audit(
+                "路由分发", target,
+                f"事件 {event_id} 路由到 {target}",
+                "route_dispatcher", "已路由"
+            )
+            # 审计写成功后才记进度：中断在写审计之前时，继续路由会补写这一条。
+            data.audited_steps.add(step)
 
-        pipeline_bus.pipeline_metrics["routed"] += 1
-        pipeline_bus.write_audit(
-            "路由分发", target,
-            f"事件 {event.get('事件ID','')} 路由到 {target}",
-            "route_dispatcher", "已路由"
-        )
+        data.routed = True
+        data.step_results[step] = route_result
+        pipeline_bus.complete_match_data(data)
         return route_result
+
+    def _route_step_key(self, config: dict[str, Any]) -> tuple[Any, ...]:
+        """一条路由规则在单次事件上的副作用单位。"""
+        return (
+            config.get("规则名称"),
+            config.get("目标通道", "default_sink"),
+            config.get("匹配条件", ""),
+            config.get("是否广播", "否"),
+            config.get("权重", "1"),
+            config.get("备用目标", ""),
+        )
+
+    def resume_event_route(self, event: dict[str, Any],
+                           config: dict[str, Any]) -> dict[str, Any]:
+        """路由中断后按同一份共用匹配数据继续。
+
+        取回的是过滤当时登记的原事件快照；已发送过的规则沿用首次结果，
+        不重复登记、计数或审计，因此表达式取值范围、发送顺序和审计次数
+        与一次性路由一致。未命中的规则依旧判不匹配、不产生副作用。
+        """
+        data = pipeline_bus.acquire_match_data(event)
+        condition = config.get("匹配条件", "")
+        if condition and not data.values.contains(condition, ROUTE_VALUE_FIELDS):
+            return {"routed": False, "reason": "condition_mismatch"}
+        return self.resume_route(data, config)
 
     def batch_route(self, events: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
         """批量路由事件。

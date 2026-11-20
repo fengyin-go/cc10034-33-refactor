@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.matching import FILTER_VALUE_FIELDS
 from app.services.base import BaseModuleService
 from app.pipeline import pipeline_bus
 
@@ -28,6 +29,9 @@ class EventFilterService(BaseModuleService):
 
         支持白名单(放行匹配)和黑名单(拦截匹配)模式，
         按优先级排序评估多条规则。
+
+        放行时把本次判定登记为共用匹配数据，路由入口按事件身份取用同一份
+        证据，不再从事件里另行抽取取值。
         """
         rule_name = config.get("规则名称", "")
         filter_type = config.get("过滤类型", "黑名单")
@@ -35,22 +39,14 @@ class EventFilterService(BaseModuleService):
         is_whitelist = config.get("是否白名单", "否") == "是"
         priority = int(config.get("优先级", "0"))
         scope = config.get("生效范围", "全部")
-        remark = config.get("备注说明", "")
 
-        event_str = str(event)
-        event_table = event.get("来源表", "")
-        event_op = event.get("操作类型", "")
-
-        matched = (
-            expression in event_str
-            or expression in event_table
-            or expression in event_op
-        )
+        data = pipeline_bus.stage_match_data(event)
+        matched = data.values.contains(expression, FILTER_VALUE_FIELDS)
 
         if matched and scope != "全部":
-            if scope == "指定表" and expression not in event_table:
+            if scope == "指定表" and expression not in data.values.source_table:
                 matched = False
-            elif scope == "指定操作" and expression not in event_op:
+            elif scope == "指定操作" and expression not in data.values.operation:
                 matched = False
 
         passed = matched if is_whitelist else not matched
@@ -64,6 +60,15 @@ class EventFilterService(BaseModuleService):
             "enabled": config.get("status") == "已启用",
         })
 
+        data.mark_filter(
+            passed=passed,
+            matched=matched,
+            matched_expression=expression if matched else "",
+            rule_name=rule_name,
+            filter_type=filter_type,
+            scope=scope,
+        )
+
         if not passed:
             pipeline_bus.pipeline_metrics["filtered"] += 1
             pipeline_bus.write_audit(
@@ -71,6 +76,10 @@ class EventFilterService(BaseModuleService):
                 f"事件被过滤规则 {rule_name} 拦截",
                 "event_filter", "已过滤"
             )
+
+        # 被拦截的事件不会进入路由，无需保留原始事件快照。
+        if not passed:
+            pipeline_bus.match_store.discard(data)
 
         return {
             "event_id": event.get("事件ID", ""),

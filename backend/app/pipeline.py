@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.matching import PIPELINE_VALUE_FIELDS, EventMatchData, MatchDataStore
+
 
 @dataclass
 class ChangeEventRecord:
@@ -92,6 +94,8 @@ class PipelineBus:
         self.routing_table: list[dict[str, Any]] = []
         # 过滤规则 — event_filter 核心配置
         self.filter_rules: list[dict[str, Any]] = []
+        # 共用匹配判定数据 — 过滤放行时登记，路由完成后释放
+        self.match_store = MatchDataStore()
         # 快照比对结果
         self.compare_results: list[dict[str, Any]] = []
         # 审计日志
@@ -200,56 +204,60 @@ class PipelineBus:
         buffer.append({"event_id": event_id, "ts": now})
         return False
 
-    def evaluate_filter(self, event: ChangeEventRecord) -> tuple[bool, list[str]]:
+    def stage_match_data(self, event: ChangeEventRecord) -> EventMatchData:
+        """过滤入口登记共用匹配判定数据。"""
+        return self.match_store.stage(event)
+
+    def acquire_match_data(self, event: ChangeEventRecord) -> EventMatchData:
+        """路由入口取用同一份匹配判定数据。"""
+        return self.match_store.acquire(event)
+
+    def complete_match_data(self, data: EventMatchData) -> None:
+        """路由完成后释放共享数据。"""
+        self.match_store.complete(data)
+
+    def evaluate_filter(self, event: ChangeEventRecord,
+                        data: EventMatchData | None = None) -> tuple[bool, list[str]]:
         """评估过滤规则，返回 (是否通过, 匹配规则列表)。"""
+        data = data or self.stage_match_data(event)
         passed = True
         matched: list[str] = []
         for rule in self.filter_rules:
             if rule.get("status") != "已启用":
                 continue
-            match = self._match_rule(event, rule)
+            match = self._match_values(data, rule.get("expression", ""))
             if match:
                 matched.append(rule["name"])
                 if rule.get("type") == "黑名单":
                     passed = False
             elif rule.get("type") == "白名单":
                 passed = False
+        data.mark_filter(passed=passed, matched=bool(matched))
         if not passed:
             self.pipeline_metrics["filtered"] += 1
+            # 拦截的事件不进入路由，共享数据无需继续保留。
+            self.match_store.discard(data)
         return passed, matched
 
-    def evaluate_route(self, event: ChangeEventRecord) -> list[str]:
+    def evaluate_route(self, event: ChangeEventRecord,
+                       data: EventMatchData | None = None) -> list[str]:
         """评估路由规则，返回目标通道列表。"""
+        data = data or self.acquire_match_data(event)
         targets: list[str] = []
         for rule in self.routing_table:
             if not rule.get("enabled"):
                 continue
-            if self._match_route(event, rule):
+            if self._match_values(data, rule.get("condition", "")):
                 targets.append(rule["target"])
+        data.routed = True
         self.pipeline_metrics["routed"] += len(targets)
         return targets
 
-    def _match_rule(self, event: ChangeEventRecord, rule: dict[str, Any]) -> bool:
-        """匹配过滤规则。"""
-        expr = rule.get("expression", "")
-        if not expr:
+    def _match_values(self, data: EventMatchData, expression: str) -> bool:
+        """过滤和路由共用的表达式判定，取值来自共享匹配数据。"""
+        if not expression:
             return False
-        return (
-            expr in event.source_table
-            or expr in event.source_db
-            or expr in event.operation
-        )
-
-    def _match_route(self, event: ChangeEventRecord, rule: dict[str, Any]) -> bool:
-        """匹配路由规则。"""
-        cond = rule.get("condition", "")
-        if not cond:
-            return False
-        return (
-            cond in event.source_table
-            or cond in event.source_db
-            or cond in event.operation
-        )
+        return data.values.contains(expression, PIPELINE_VALUE_FIELDS)
 
     def write_audit(self, operation: str, target: str, summary: str,
                     source_info: str, result: str, remark: str = "") -> dict[str, Any]:
@@ -328,6 +336,8 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "match_pending": self.match_store.pending_count,
+            "match_completed": self.match_store.completed_total,
         }
 
 
